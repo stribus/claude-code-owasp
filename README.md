@@ -36,7 +36,7 @@ Location: `.claude/skills/owasp-security/`
 
 `reference/` (loaded on demand, following Claude Code progressive-disclosure best practices):
 - **`languages.md`** - language-specific security quirks for 20+ languages with unsafe/safe examples
-- **`config-and-supply-chain.md`** - A02 and A03 where they actually live: Dockerfiles, Kubernetes, Terraform, framework config, security headers, lockfile enforcement per ecosystem, dependency confusion, install scripts, and CI/CD workflow attacks
+- **`config-and-supply-chain.md`** - A02 and A03 where they actually live: Dockerfiles, Kubernetes, Terraform, framework config, security headers, lockfile enforcement per ecosystem, dependency confusion, install scripts, and CI/CD attacks on both GitHub Actions and Azure DevOps
 - **`owasp-report.md`** - deep-dive on the Top 10:2025, ASVS 5.0, the LLM Top 10 (2025), and the Agentic list (2026), with per-item attack vectors and mitigations
 
 ### Accuracy

