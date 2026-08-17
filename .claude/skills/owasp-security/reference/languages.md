@@ -2,13 +2,14 @@
 
 > **Important:** The examples below are illustrative starting points, not exhaustive. When reviewing code, think like a senior security researcher: consider the language's memory model, type system, standard library pitfalls, ecosystem-specific attack vectors, and historical CVE patterns. Each language has deeper quirks beyond what's listed here.
 
-Different languages have unique security pitfalls. This file covers the top 20 languages with key security considerations. **Go deeper for the specific language you're working in.**
+Different languages have unique security pitfalls. This file covers 20+ languages and frameworks with key security considerations. **Go deeper for the specific language you're working in.**
 
 ## Contents
 - [JavaScript / TypeScript](#javascript--typescript)
+- [Angular](#angular)
 - [Python](#python)
 - [Java](#java)
-- [C#](#c)
+- [C# / .NET](#c--net)
 - [PHP](#php)
 - [Go](#go)
 - [Ruby](#ruby)
@@ -46,6 +47,68 @@ eval(userCode); new Function(userCode); setTimeout(userCode, 0);
 `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write()`, `dangerouslySetInnerHTML`,
 `location`/`href` assignment from user input, `__proto__` and `constructor.prototype`,
 `postMessage` handlers without an `origin` check.
+
+**Node.js specifically:** `child_process.exec`/`execSync` (use `execFile` with an argv array),
+`fs` paths built from user input (traverse with `../`), dynamic `require()`, `vm` used as a
+sandbox (it is not one), SSRF via `fetch`/`axios` to a user-supplied URL, and JWT libraries
+accepting `alg: none` or a user-chosen algorithm.
+
+---
+
+### Angular
+
+**Main Risks:** Sanitizer bypass, secrets shipped in the bundle, guards mistaken for authorization
+
+Angular escapes by default in templates — `{{ value }}` is safe, and `[innerHTML]` is sanitized.
+Almost every Angular XSS is therefore something that **deliberately turned the sanitizer off**,
+which makes the review targeted: find the bypasses.
+
+```typescript
+// UNSAFE: bypassSecurityTrust* disables sanitization for that value
+this.html = this.sanitizer.bypassSecurityTrustHtml(userContent);
+// UNSAFE: the classic — user-controlled iframe/script source
+this.url = this.sanitizer.bypassSecurityTrustResourceUrl(userUrl);
+// SAFE: let Angular sanitize; if you must allow rich text, sanitize server-side
+// with an allowlist (DOMPurify) and keep the value going through [innerHTML]
+this.html = userContent;   // template: <div [innerHTML]="html"></div>
+
+// UNSAFE: writing to the DOM directly bypasses Angular entirely
+this.el.nativeElement.innerHTML = userContent;
+// SAFE: Renderer2 with text, or property binding
+this.renderer.setProperty(this.el.nativeElement, 'textContent', userContent);
+```
+
+```typescript
+// UNSAFE: environment files are compiled INTO the browser bundle.
+// Anything here is public — "production" does not mean "private".
+export const environment = {
+  production: true,
+  apiKey: 'sk-live-...',          // shipped to every visitor
+  dbConnection: '...',
+};
+// SAFE: the browser holds no secrets. Proxy privileged calls through your backend.
+export const environment = { production: true, apiUrl: '/api' };
+```
+
+```typescript
+// UNSAFE to RELY ON: a route guard is UX, not authorization.
+// The user controls the bundle; they can call the API directly.
+canActivate(): boolean { return this.auth.isAdmin(); }
+// The server must enforce the same rule — see [Authorize] in the C# section.
+```
+
+**Watch for:**
+- Any `bypassSecurityTrust*` call — each one needs a justification and a sanitized input
+- `ElementRef.nativeElement` DOM writes, `document.write`, jQuery mixed into a component
+- Secrets, API keys, or connection strings in `environment*.ts`
+- Tokens in `localStorage` (readable by any XSS) — prefer `HttpOnly; Secure; SameSite` cookies
+- CSRF: `HttpClientXsrfModule` only sends the header; the **backend must validate it**, and it
+  only works when the API is same-origin
+- JIT compilation / templates built from user input (SSTI); AOT is the default — keep it, it also
+  lets your CSP drop `unsafe-eval`
+- Source maps enabled in a production build (`ng build` config), exposing full source
+- `[href]`/`[src]` bound to user data — Angular blocks `javascript:` in URL context, but not if
+  the value was marked trusted first
 
 ---
 
@@ -89,22 +152,95 @@ mapper.readValue(json, SafeClass.class);
 
 ---
 
-### C#
-**Main Risks:** Deserialization, SQL injection, path traversal
+### C# / .NET
+**Main Risks:** Deserialization, SQL injection, path traversal, overposting, missing authorization
+
 ```csharp
-// UNSAFE: BinaryFormatter RCE
+// UNSAFE: BinaryFormatter RCE (obsolete since .NET 5, removed in .NET 9)
 BinaryFormatter bf = new BinaryFormatter();
 object obj = bf.Deserialize(stream);
-
-// SAFE: Use System.Text.Json
+// UNSAFE: Newtonsoft type handling lets the payload choose the type to instantiate
+JsonConvert.DeserializeObject<T>(json,
+    new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All });
+// SAFE: System.Text.Json, concrete type, no polymorphic binding from the wire
 var obj = JsonSerializer.Deserialize<SafeType>(json);
 ```
-**Watch for:** `BinaryFormatter`, `JavaScriptSerializer`, `TypeNameHandling.All`, raw SQL strings
+
+```csharp
+// UNSAFE: concatenation
+var sql = "SELECT * FROM Users WHERE Email = '" + email + "'";
+// UNSAFE: FromSqlRaw with an interpolated string is still concatenation
+ctx.Users.FromSqlRaw($"SELECT * FROM Users WHERE Email = '{email}'");
+// SAFE: FromSqlInterpolated parameterizes the interpolation holes
+ctx.Users.FromSqlInterpolated($"SELECT * FROM Users WHERE Email = {email}");
+// SAFE: explicit parameters with ADO.NET
+cmd.CommandText = "SELECT * FROM Users WHERE Email = @email";
+cmd.Parameters.Add(new SqlParameter("@email", SqlDbType.NVarChar, 256) { Value = email });
+```
+
+```csharp
+// UNSAFE: Path.Combine DISCARDS earlier segments if a later one is rooted.
+// userPath = "C:\\Windows\\win.ini" or "/etc/passwd" escapes the base entirely.
+var path = Path.Combine(baseDir, userPath);
+// SAFE: canonicalize, then verify containment
+var full = Path.GetFullPath(Path.Combine(baseDir, userPath));
+var root = Path.GetFullPath(baseDir) + Path.DirectorySeparatorChar;
+if (!full.StartsWith(root, StringComparison.Ordinal)) return Forbid();
+```
+
+```csharp
+// UNSAFE: overposting — the binder fills every property the model exposes,
+// including IsAdmin, if the request body sends it
+public IActionResult Update(User user) { _db.Update(user); ... }
+// SAFE: bind to a DTO carrying only what the caller may set
+public IActionResult Update(UserUpdateDto dto) { ... }
+```
+
+```csharp
+// UNSAFE: open redirect — returnUrl may point off-site
+return Redirect(returnUrl);
+// SAFE: LocalRedirect throws on an absolute URL
+return LocalRedirect(returnUrl);
+
+// UNSAFE: predictable — System.Random is not a CSPRNG
+var token = new Random().Next().ToString();
+// SAFE
+var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+
+// UNSAFE: disables certificate validation globally
+ServicePointManager.ServerCertificateValidationCallback = (s, c, ch, e) => true;
+```
+
+**ASP.NET Core configuration to verify:**
+```csharp
+// Deny by default: unauthenticated requests are rejected unless [AllowAnonymous]
+builder.Services.AddAuthorization(o =>
+    o.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
+// CSRF on every state-changing MVC action, not per-controller
+builder.Services.AddControllersWithViews(o =>
+    o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute()));
+
+if (app.Environment.IsDevelopment())
+    app.UseDeveloperExceptionPage();   // must stay gated by environment
+else { app.UseExceptionHandler("/error"); app.UseHsts(); }
+app.UseHttpsRedirection();
+```
+
+**Watch for:** `BinaryFormatter`, `LosFormatter`, `NetDataContractSerializer`,
+`JavaScriptSerializer`, `TypeNameHandling` other than `None`, `FromSqlRaw`/`ExecuteSqlRaw` with
+interpolation, `@Html.Raw()` in Razor, `Path.Combine` with user input, `[AllowAnonymous]` on
+sensitive actions, controllers missing `[Authorize]` where there is no fallback policy,
+`ValidateAntiForgeryToken` applied inconsistently, `Process.Start` with `UseShellExecute = true`,
+`XmlDocument`/`XmlTextReader` without `XmlResolver = null` and `DtdProcessing.Prohibit` (XXE),
+`Regex` on user input without `matchTimeout` (ReDoS), connection strings and keys in
+`appsettings.json` or `web.config` committed to git (use User Secrets locally, Key Vault in
+production), and ViewState with MAC/encryption disabled or a machine key checked into source.
 
 ---
 
 ### PHP
-**Main Risks:** Type juggling, file inclusion, object injection
+**Main Risks:** Type juggling, file inclusion, object injection, weak SQL layer defaults
+
 ```php
 // UNSAFE: Type juggling — "magic hashes" like "0e123" == "0e456" both cast to float 0
 if ($password == $stored_hash) { ... }
@@ -114,13 +250,67 @@ if (password_verify($password, $stored_hash)) { ... }
 $hash = password_hash($password, PASSWORD_DEFAULT);
 // Comparing two known strings (tokens, HMACs, webhook signatures):
 if (hash_equals($expected_token, $provided_token)) { ... }
+```
 
-// UNSAFE: File inclusion
+```php
+// UNSAFE: emulated prepares build the query string client-side — with a bad charset
+// this reopens injection. Turn emulation off explicitly.
+$pdo = new PDO($dsn, $user, $pass);
+// SAFE
+$pdo = new PDO($dsn, $user, $pass, [
+    PDO::ATTR_EMULATE_PREPARES   => false,
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+]);
+$stmt = $pdo->prepare('SELECT * FROM users WHERE email = ?');
+$stmt->execute([$email]);
+```
+
+```php
+// UNSAFE: File inclusion (LFI/RFI)
 include($_GET['page'] . '.php');
 // SAFE: Allowlist pages
-$allowed = ['home', 'about']; include(in_array($page, $allowed) ? "$page.php" : 'home.php');
+$allowed = ['home', 'about']; include(in_array($page, $allowed, true) ? "$page.php" : 'home.php');
+
+// UNSAFE: object injection — unserialize() instantiates classes and fires magic
+// methods (__wakeup, __destruct), which is how POP-chain RCE works
+$obj = unserialize($_COOKIE['data']);
+// SAFE: JSON, or forbid class instantiation entirely
+$obj = json_decode($_COOKIE['data'], true);
+$obj = unserialize($data, ['allowed_classes' => false]);
 ```
-**Watch for:** `==` vs `===`, `include/require`, `unserialize()`, `preg_replace` with `/e`, `extract()`
+
+```php
+// UNSAFE: escapeshellcmd does NOT make arguments safe (quotes stay exploitable)
+system('convert ' . escapeshellcmd($file));
+// SAFE: escape each argument, or skip the shell
+system('convert ' . escapeshellarg($file) . ' out.png');
+
+// UNSAFE: trusting client-supplied upload metadata — both are attacker-controlled
+if ($_FILES['f']['type'] === 'image/png') { ... }
+// SAFE: check real content, generate your own name and extension, store outside webroot
+$mime = (new finfo(FILEINFO_MIME_TYPE))->file($_FILES['f']['tmp_name']);
+$name = bin2hex(random_bytes(16)) . '.png';   // never trust the original filename
+```
+
+```php
+// Sessions: regenerate on privilege change, and set cookie flags
+session_set_cookie_params(['httponly' => true, 'secure' => true, 'samesite' => 'Lax']);
+session_regenerate_id(true);   // on login — otherwise session fixation
+```
+
+**Watch for:** `==` and `in_array`/`switch` without strict comparison, `include`/`require` with
+request data, `unserialize()`, `extract()`, variable variables (`$$var`), `eval()`, `assert()`
+with a string, backticks, `preg_replace` with `/e` (legacy), `move_uploaded_file` without content
+validation, `header()` with user input (response splitting), `$_REQUEST` (mixes GET/POST/COOKIE),
+`display_errors = On` in production, and secrets in `.env` or config files served from the webroot.
+
+**Laravel:** `$guarded = []` or `forceFill` (mass assignment), `DB::raw()` and `whereRaw()` with
+interpolation, `{!! !!}` in Blade (unescaped output — `{{ }}` is safe), `APP_DEBUG=true` in
+production (Ignition leaks env and config), routes missing `auth`/`can` middleware, and
+`Storage::url()` on user-named files.
+**Symfony/Twig:** `|raw` filter, Doctrine DQL built by concatenation, and `dev.php`/`_profiler`
+reachable in production.
 
 ---
 
