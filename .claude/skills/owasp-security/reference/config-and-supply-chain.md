@@ -35,10 +35,10 @@ and frequently unreviewed:
 | Containers | `Dockerfile*`, `docker-compose*.yml`, `.dockerignore` |
 | Orchestration | `k8s/**/*.yaml`, `helm/**/values.yaml`, `*.deployment.yaml` |
 | Infrastructure | `*.tf`, `*.tfvars`, `cdk/**`, `template.yaml` (SAM), `serverless.yml` |
-| App config | `settings.py`, `application*.yml`, `appsettings*.json`, `next.config.js`, `.env*` |
+| App config | `settings.py`, `application*.yml`, `appsettings*.json`, `web.config`, `php.ini`, `.htaccess`, `next.config.js`, `environment*.ts`, `.env*` |
 | Web server | `nginx.conf`, `httpd.conf`, ingress annotations |
-| Dependencies | `package.json` + lockfile, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `Gemfile`, `Cargo.toml` |
-| Registry config | `.npmrc`, `pip.conf`, `settings.xml`, `.yarnrc.yml` |
+| Dependencies | `package.json` + lockfile, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `*.csproj` / `packages.lock.json`, `composer.json` + `composer.lock`, `Gemfile`, `Cargo.toml` |
+| Registry config | `.npmrc`, `pip.conf`, `nuget.config`, `settings.xml`, `.yarnrc.yml`, `composer.json` `repositories` |
 | Pipelines | `azure-pipelines*.yml`, `.azuredevops/**`, `.github/workflows/*.yml`, `.gitlab-ci.yml`, `Jenkinsfile` |
 
 Two questions cut through most of it: **what runs as root or with wildcard permissions**, and
@@ -198,6 +198,23 @@ SESSION_COOKIE_SECURE = False
 - TLS: versions below 1.2 enabled, weak ciphers, certificate verification disabled in clients
   (`verify=False`, `rejectUnauthorized: false`, `InsecureSkipVerify: true`)
 
+**ASP.NET Core / .NET:** connection strings and API keys committed in `appsettings.json` (use
+User Secrets locally, Key Vault in production — and remember `appsettings.Development.json` still
+ships in the repo); `UseDeveloperExceptionPage` not gated by `IsDevelopment()`; `web.config` with
+`<customErrors mode="Off"/>` or `<compilation debug="true"/>`; a `machineKey` checked into source;
+missing `UseHsts()`/`UseHttpsRedirection()`; permissive CORS policy (`AllowAnyOrigin` together
+with `AllowCredentials` is rejected at runtime, so look for the reflective workaround
+`SetIsOriginAllowed(_ => true)` — that is the same hole).
+
+**PHP:** `display_errors = On` or `expose_php = On` in production `php.ini`; `.env`, `composer.lock`,
+`.git/` reachable under the webroot (document root should point at `public/`, not the project root);
+`allow_url_include`/`allow_url_fopen` enabled; `session.cookie_httponly`/`cookie_secure` off;
+`APP_DEBUG=true` in a Laravel production deploy; `/_profiler` or `dev.php` shipped in Symfony.
+
+**Angular:** secrets in `environment.prod.ts` (the bundle is public — see the Angular section in
+[`languages.md`](languages.md)); source maps enabled in the production build; a CSP that needs
+`unsafe-eval` because the app still builds in JIT rather than AOT.
+
 ---
 
 ## A02 — Security Headers
@@ -226,6 +243,8 @@ fresh versions and the review you did does not describe what ships.
 | yarn | `yarn install` | `yarn install --immutable` |
 | pnpm | `pnpm install` | `pnpm install --frozen-lockfile` |
 | Python | `pip install -r requirements.txt` (unpinned) | pinned `==` + hashes, `pip install --require-hashes`, or `uv sync --frozen` / `poetry install` with committed lock |
+| Composer (PHP) | `composer update` | `composer install` (fails if lock is stale/absent) |
+| NuGet (.NET) | `dotnet restore` without a lock | `packages.lock.json` committed + `dotnet restore --locked-mode` |
 | Go | — | `go mod verify` + committed `go.sum` |
 | Rust | — | committed `Cargo.lock` (binaries), `cargo --locked` |
 | Java | version ranges in `pom.xml` | fixed versions + `dependency-lock` / `mvn -o` with verified checksums |
@@ -252,8 +271,35 @@ registry=https://registry.npmjs.org/
 //npm.internal.example.com/:_authToken=${NPM_TOKEN}
 ```
 
+NuGet is the ecosystem where this bites hardest with Azure Artifacts, because a feed with an
+upstream to nuget.org will happily serve a public package that shadows an internal name. The fix
+is **package source mapping**, which binds a name pattern to one source:
+
+```xml
+<!-- nuget.config — SAFE: internal prefixes can only ever come from the internal feed -->
+<configuration>
+  <packageSources>
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    <add key="internal"  value="https://pkgs.dev.azure.com/org/_packaging/feed/nuget/v3/index.json" />
+  </packageSources>
+  <packageSourceMapping>
+    <packageSource key="internal">
+      <package pattern="MyCompany.*" />
+    </packageSource>
+    <packageSource key="nuget.org">
+      <package pattern="*" />
+    </packageSource>
+  </packageSourceMapping>
+</configuration>
+```
+
+Composer equivalent: declare the private repository and set `"canonical": true` so Packagist is
+never consulted for those names.
+
 **Check for:**
 - Internal package names used unscoped, or scopes not pinned to an internal registry
+- `nuget.config` without `<packageSourceMapping>` while an internal feed has an upstream to
+  nuget.org — this is the dependency confusion path in a .NET shop
 - A proxy/mirror configured to fall through to the public registry for internal names
 - `pip install --extra-index-url` — pip picks the highest version across **all** indexes; use
   `--index-url` with a single trusted mirror
@@ -272,6 +318,9 @@ package in the tree, with the developer's or CI runner's privileges.
 // Review any package that ships this — it is the standard malware entry point
 { "scripts": { "postinstall": "node ./scripts/collect.js" } }
 ```
+
+Composer has the same exposure via `scripts` (`post-install-cmd`, `post-autoload-dump`) — run
+`composer install --no-scripts` in CI when the build does not need them.
 
 Mitigations: `npm ci --ignore-scripts` (then run the builds you actually need explicitly),
 `pip install --only-binary :all:` to avoid arbitrary `setup.py` execution, and running installs
@@ -408,7 +457,8 @@ inline script body.
 ## A03 — Provenance, Signing, and SBOM
 
 - Generate an SBOM (CycloneDX or SPDX) as a build artifact, not as a one-off report
-- Verify signatures before deploy: `cosign verify`, `npm audit signatures`, sigstore attestations
+- Verify signatures before deploy: `cosign verify`, `npm audit signatures`,
+  `dotnet nuget verify --all`, `composer audit`, sigstore attestations
 - Publish with provenance (`npm publish --provenance`, SLSA attestations) so consumers can verify
   which workflow and commit produced an artifact
 - Pin container images by digest, not tag — a tag can be repointed after your review
